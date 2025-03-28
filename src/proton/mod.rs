@@ -8,6 +8,10 @@ pub const STREAM_ACTION: u8 = 3;
 pub const MAX_BIDIRECTIONAL_STREAMS: u32 = 3;
 pub const MAX_CONNECTIONS: u32 = 1;
 
+// Connect retry delay
+pub const MAX_CONNECT_RETRIES: u32 = 5;
+pub const CONNECT_RETRY_DELAY: Duration = Duration::from_secs(2);
+
 // Protocol timeouts
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const STARTUP_DELAY: Duration = Duration::from_secs(10); // 2 * IDLE_TIMEOUT
@@ -18,6 +22,7 @@ pub enum ProtonError {
     IoError(std::io::Error),
     ConnectionError,
     InvalidStream,
+    Timeout,
 }
 
 impl fmt::Display for ProtonError {
@@ -26,6 +31,7 @@ impl fmt::Display for ProtonError {
             ProtonError::IoError(e) => write!(f, "IO error: {}", e),
             ProtonError::ConnectionError => write!(f, "Connection error"),
             ProtonError::InvalidStream => write!(f, "Invalid stream"),
+            ProtonError::Timeout => write!(f, "Operation timed out"),
         }
     }
 }
@@ -75,7 +81,7 @@ impl From<quinn::ReadExactError> for ProtonError {
     }
 }
 
-mod client;
+pub mod client;
 mod server;
 
 pub use client::ProtonClient;

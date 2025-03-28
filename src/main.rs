@@ -1,9 +1,12 @@
 use std::error::Error;
+use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio;
 
+mod client_repl;
 mod proton;
+use crate::client_repl::ClientRepl;
 use crate::proton::{ProtonClient, ProtonServer};
 
 #[tokio::main]
@@ -12,7 +15,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().collect();
 
     if args.len() < 2 {
-        println!("Usage: {} <server|client> [server_addr]", args[0]);
+        println!(
+            "Usage: {} <server|client|client_repl> [server_addr]",
+            args[0]
+        );
         return Ok(());
     }
 
@@ -50,10 +56,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 connection.read_action().await?;
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
+
+            // Explicitly close the connection when done
+            connection.close().await;
             Ok(())
         }
+        "client_repl" => {
+            let server_addr: SocketAddr = if args.len() > 2 {
+                args[2].parse()?
+            } else {
+                "127.0.0.1:5000".parse()?
+            };
+
+            let bind_addr: SocketAddr = "127.0.0.1:0".parse()?;
+            let mut repl = ClientRepl::new(bind_addr, server_addr)?;
+            repl.run().await
+        }
         _ => {
-            println!("Invalid command. Use 'server' or 'client'");
+            println!("Invalid command. Use 'server', 'client' or 'client_repl'");
             Ok(())
         }
     }

@@ -2,10 +2,10 @@ use crate::proton::{
     ProtonError, IDLE_TIMEOUT, MAX_BIDIRECTIONAL_STREAMS, MAX_CONNECTIONS, STARTUP_DELAY,
     STREAM_ACTION, STREAM_EVENT, STREAM_STATE_COMMIT, STREAM_TIMEOUT,
 };
-use quinn::{Endpoint, RecvStream, SendStream, ServerConfig};
+use quinn::{Connection as QuinnConnection, Endpoint, RecvStream, SendStream, ServerConfig};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout};
 
 struct StreamPair {
@@ -67,7 +67,12 @@ impl ProtonStreamHandler {
         }
     }
 
-    async fn handle_all_streams(&mut self) -> Result<(), ProtonError> {
+    async fn handle_all_streams(
+        &mut self,
+        connection: &QuinnConnection,
+    ) -> Result<(), ProtonError> {
+        let closed = connection.closed();
+
         let event_stream_fut = async {
             if let Some(StreamPair {
                 ref mut send,
@@ -76,21 +81,45 @@ impl ProtonStreamHandler {
             {
                 loop {
                     let mut data = [0u8; 4];
-                    timeout(STREAM_TIMEOUT, recv.read_exact(&mut data)).await??;
-                    let event_id = u32::from_le_bytes(data);
+                    match timeout(STREAM_TIMEOUT, recv.read_exact(&mut data)).await {
+                        Ok(Ok(_)) => {
+                            let event_id = u32::from_le_bytes(data);
 
-                    // Verify monotonicity
-                    if event_id <= self.last_event_id {
-                        return Err(ProtonError::InvalidStream);
+                            // Verify monotonicity
+                            if event_id <= self.last_event_id {
+                                return Err(ProtonError::InvalidStream);
+                            }
+                            self.last_event_id = event_id;
+
+                            // Send acknowledgment
+                            match timeout(STREAM_TIMEOUT, send.write_all(&event_id.to_le_bytes()))
+                                .await
+                            {
+                                Ok(Ok(_)) => {
+                                    println!("Event {} acknowledged", event_id);
+                                }
+                                Ok(Err(e)) => {
+                                    eprintln!("Failed to send event ack: {}", e);
+                                    return Err(ProtonError::ConnectionError);
+                                }
+                                Err(_) => {
+                                    eprintln!("Timeout sending event ack");
+                                    return Err(ProtonError::Timeout);
+                                }
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            eprintln!("Failed to read event: {}", e);
+                            return Err(ProtonError::ConnectionError);
+                        }
+                        Err(_) => {
+                            eprintln!("Timeout reading event");
+                            return Err(ProtonError::Timeout);
+                        }
                     }
-                    self.last_event_id = event_id;
-
-                    // Send acknowledgment
-                    timeout(STREAM_TIMEOUT, send.write_all(&event_id.to_le_bytes())).await??;
-                    println!("Event {} acknowledged", event_id);
                 }
             }
-            Ok::<(), ProtonError>(())
+            Ok(())
         };
 
         let state_commit_stream_fut = async {
@@ -101,16 +130,41 @@ impl ProtonStreamHandler {
             {
                 loop {
                     let mut data = [0u8; 4];
-                    timeout(STREAM_TIMEOUT, recv.read_exact(&mut data)).await??;
-                    let commit_id = u32::from_le_bytes(data);
-                    println!("Received state commit: {}", commit_id);
+                    match timeout(STREAM_TIMEOUT, recv.read_exact(&mut data)).await {
+                        Ok(Ok(_)) => {
+                            let commit_id = u32::from_le_bytes(data);
+                            println!("Received state commit: {}", commit_id);
 
-                    // Send response
-                    let response = commit_id + 2;
-                    timeout(STREAM_TIMEOUT, send.write_all(&response.to_le_bytes())).await??;
+                            // Send response
+                            let response = commit_id + 2;
+                            match timeout(STREAM_TIMEOUT, send.write_all(&response.to_le_bytes()))
+                                .await
+                            {
+                                Ok(Ok(_)) => {
+                                    println!("State commit {} response sent", commit_id);
+                                }
+                                Ok(Err(e)) => {
+                                    eprintln!("Failed to send state commit response: {}", e);
+                                    return Err(ProtonError::ConnectionError);
+                                }
+                                Err(_) => {
+                                    eprintln!("Timeout sending state commit response");
+                                    return Err(ProtonError::Timeout);
+                                }
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            eprintln!("Failed to read state commit: {}", e);
+                            return Err(ProtonError::ConnectionError);
+                        }
+                        Err(_) => {
+                            eprintln!("Timeout reading state commit");
+                            return Err(ProtonError::Timeout);
+                        }
+                    }
                 }
             }
-            Ok::<(), ProtonError>(())
+            Ok(())
         };
 
         let action_stream_fut = async {
@@ -122,20 +176,49 @@ impl ProtonStreamHandler {
                 let mut counter = 0u32;
                 loop {
                     let mut data = [0u8; 4];
-                    timeout(STREAM_TIMEOUT, recv.read_exact(&mut data)).await??;
-                    let request_id = u32::from_le_bytes(data);
-                    println!("Received action request: {}", request_id);
+                    match timeout(STREAM_TIMEOUT, recv.read_exact(&mut data)).await {
+                        Ok(Ok(_)) => {
+                            let request_id = u32::from_le_bytes(data);
+                            println!("Received action request: {}", request_id);
 
-                    // Send action
-                    let action = counter;
-                    timeout(STREAM_TIMEOUT, send.write_all(&action.to_le_bytes())).await??;
-                    counter += 1;
+                            // Send action
+                            let action = counter;
+                            match timeout(STREAM_TIMEOUT, send.write_all(&action.to_le_bytes()))
+                                .await
+                            {
+                                Ok(Ok(_)) => {
+                                    println!("Action {} sent", action);
+                                    counter += 1;
+                                }
+                                Ok(Err(e)) => {
+                                    eprintln!("Failed to send action: {}", e);
+                                    return Err(ProtonError::ConnectionError);
+                                }
+                                Err(_) => {
+                                    eprintln!("Timeout sending action");
+                                    return Err(ProtonError::Timeout);
+                                }
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            eprintln!("Failed to read action request: {}", e);
+                            return Err(ProtonError::ConnectionError);
+                        }
+                        Err(_) => {
+                            eprintln!("Timeout reading action request");
+                            return Err(ProtonError::Timeout);
+                        }
+                    }
                 }
             }
-            Ok::<(), ProtonError>(())
+            Ok(())
         };
 
         tokio::select! {
+            _ = closed => {
+                println!("Client closed connection");
+                Ok(())
+            }
             r = event_stream_fut => r,
             r = state_commit_stream_fut => r,
             r = action_stream_fut => r,
@@ -212,6 +295,7 @@ impl ProtonServer {
 
             // Ensure connection is cleaned up
             *self.active_connection.lock().await = None;
+            println!("Connection cleanup complete, ready for new connections");
         }
 
         Ok(())
@@ -268,18 +352,37 @@ impl ProtonServer {
             }
         }
 
-        // Store the active connection and start handling streams
+        // Store the active connection
         *conn_guard = Some(stream_handler);
-        let handler = conn_guard.as_mut().unwrap();
+        let mut handler = conn_guard.take().unwrap();
+        // Drop the lock so we can acquire it again later
+        drop(conn_guard);
 
         // Handle all streams in a single task
-        if let Err(e) = handler.handle_all_streams().await {
-            eprintln!("Stream error: {}", e);
-            connection.close(4u32.into(), b"Stream error");
+        let stream_result = handler.handle_all_streams(&connection).await;
+
+        // Get the lock again to clear the connection state
+        let mut conn_guard = active_connection.lock().await;
+        *conn_guard = None;
+        drop(conn_guard);
+        println!("Connection state cleared");
+
+        // Handle the stream result and close the connection appropriately
+        match stream_result {
+            Ok(_) => {
+                println!("Streams completed normally");
+                connection.close(0u32.into(), b"Streams completed");
+            }
+            Err(ProtonError::Timeout) => {
+                eprintln!("Stream operation timed out");
+                connection.close(4u32.into(), b"Stream operation timeout");
+            }
+            Err(e) => {
+                eprintln!("Stream error: {}", e);
+                connection.close(5u32.into(), b"Stream error");
+            }
         }
 
-        // Clear the connection on exit
-        *active_connection.lock().await = None;
         Ok(())
     }
 }

@@ -1,6 +1,6 @@
 use crate::proton::{
-    ProtonError, IDLE_TIMEOUT, MAX_BIDIRECTIONAL_STREAMS, STARTUP_DELAY, STREAM_ACTION,
-    STREAM_EVENT, STREAM_STATE_COMMIT, STREAM_TIMEOUT,
+    ProtonError, CONNECT_RETRY_DELAY, IDLE_TIMEOUT, MAX_BIDIRECTIONAL_STREAMS, MAX_CONNECT_RETRIES,
+    STARTUP_DELAY, STREAM_ACTION, STREAM_EVENT, STREAM_STATE_COMMIT, STREAM_TIMEOUT,
 };
 use quinn::{ClientConfig, Connection as QuinnConnection, Endpoint, RecvStream, SendStream};
 use std::net::SocketAddr;
@@ -137,7 +137,7 @@ impl ProtonClient {
     pub async fn connect(
         &mut self,
         server_addr: SocketAddr,
-    ) -> Result<ProtonConnection<'_>, ProtonError> {
+    ) -> Result<ProtonConnection, ProtonError> {
         // Wait for startup delay to ensure old connections are cleaned up
         println!(
             "Waiting {} seconds for startup delay...",
@@ -145,41 +145,71 @@ impl ProtonClient {
         );
         sleep(STARTUP_DELAY).await;
 
-        // Connect to server
-        let connection = self.endpoint.connect(server_addr, "localhost")?.await?;
-        println!("Connected to server at {}", server_addr);
+        // Try connecting to server with retries
+        let mut retry_count = 0;
 
-        // Create protocol client
-        let mut handler = ProtonStreamHandler::new(connection.clone());
+        loop {
+            match self.endpoint.connect(server_addr, "localhost")?.await {
+                Ok(connection) => {
+                    println!("Connected to server at {}", server_addr);
 
-        // Establish all streams
-        handler.establish_streams().await?;
-        println!("All streams established");
+                    // Create protocol client
+                    let mut handler = ProtonStreamHandler::new(connection.clone());
 
-        Ok(ProtonConnection {
-            handler,
-            last_event_id: &mut self.last_event_id,
-        })
+                    // Establish all streams
+                    match handler.establish_streams().await {
+                        Ok(_) => {
+                            println!("All streams established");
+                            return Ok(ProtonConnection {
+                                handler,
+                                last_event_id: &mut self.last_event_id,
+                            });
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to establish streams: {}", e);
+                            if retry_count >= MAX_CONNECT_RETRIES {
+                                return Err(e);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to connect: {}", e);
+                    if retry_count >= MAX_CONNECT_RETRIES {
+                        return Err(ProtonError::ConnectionError);
+                    }
+                }
+            }
+
+            retry_count += 1;
+            println!(
+                "Retrying connection ({}/{})",
+                retry_count, MAX_CONNECT_RETRIES
+            );
+            sleep(CONNECT_RETRY_DELAY).await;
+        }
     }
 }
 
-pub struct ProtonConnection<'a> {
+pub struct ProtonConnection {
     handler: ProtonStreamHandler,
-    last_event_id: &'a mut u32,
+    last_event_id: *mut u32,
 }
 
-impl<'a> ProtonConnection<'a> {
+impl ProtonConnection {
     pub async fn send_event(&mut self) -> Result<u32, ProtonError> {
-        *self.last_event_id += 1;
-        let event_id = *self.last_event_id;
-        match self.handler.send_event(event_id).await {
-            Ok(ack) => {
-                println!("Event {} acknowledged with {}", event_id, ack);
-                Ok(ack)
-            }
-            Err(e) => {
-                eprintln!("Failed to send event {}: {}", event_id, e);
-                Err(e)
+        unsafe {
+            *self.last_event_id += 1;
+            let event_id = *self.last_event_id;
+            match self.handler.send_event(event_id).await {
+                Ok(ack) => {
+                    println!("Event {} acknowledged with {}", event_id, ack);
+                    Ok(ack)
+                }
+                Err(e) => {
+                    eprintln!("Failed to send event {}: {}", event_id, e);
+                    Err(e)
+                }
             }
         }
     }
@@ -210,6 +240,26 @@ impl<'a> ProtonConnection<'a> {
                 eprintln!("Failed to read action: {}", e);
                 Err(e)
             }
+        }
+    }
+
+    pub async fn close(&mut self) {
+        if self.handler.connection.close_reason().is_none() {
+            println!("Closing connection to server");
+            self.handler
+                .connection
+                .close(0u32.into(), b"Client closed connection");
+        }
+    }
+}
+
+impl Drop for ProtonConnection {
+    fn drop(&mut self) {
+        if self.handler.connection.close_reason().is_none() {
+            println!("Warning: ProtonConnection dropped without explicit close()");
+            self.handler
+                .connection
+                .close(0u32.into(), b"Client dropped without explicit close");
         }
     }
 }
