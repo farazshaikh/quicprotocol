@@ -1,5 +1,4 @@
 use std::error::Error;
-use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio;

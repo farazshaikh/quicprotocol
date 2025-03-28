@@ -10,7 +10,6 @@ use rustyline::Helper;
 use rustyline::{CompletionType, Config, Context, Editor};
 use std::borrow::Cow::{self, Borrowed};
 use std::error::Error;
-use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::time::sleep;
