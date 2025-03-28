@@ -1,24 +1,161 @@
 use crate::proton::client::ProtonConnection;
 use crate::proton::{ProtonClient, IDLE_TIMEOUT};
+use rustyline::completion::{Completer, Pair};
+use rustyline::error::ReadlineError;
+use rustyline::highlight::Highlighter;
+use rustyline::hint::{Hinter, HistoryHinter};
+use rustyline::history::FileHistory;
+use rustyline::validate::{MatchingBracketValidator, Validator};
+use rustyline::Helper;
+use rustyline::{CompletionType, Config, Context, Editor};
+use std::borrow::Cow::{self, Borrowed};
 use std::error::Error;
 use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::time::sleep;
 
+// Define available commands for completion
+const COMMANDS: &[&str] = &[
+    "connect",
+    "send_event",
+    "commit",
+    "read_action",
+    "close",
+    "sleep",
+    "reset",
+    "help",
+    "exit",
+];
+
+// Helper struct for rustyline functionality
+struct ReplHelper {
+    validator: MatchingBracketValidator,
+    hinter: HistoryHinter,
+}
+
+impl ReplHelper {
+    fn new() -> Self {
+        Self {
+            validator: MatchingBracketValidator::new(),
+            hinter: HistoryHinter {},
+        }
+    }
+}
+
+// Implement completion for commands
+impl Completer for ReplHelper {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Pair>)> {
+        // Split the input into parts
+        let parts: Vec<&str> = line[..pos].split_whitespace().collect();
+
+        // Handle completion for different contexts
+        let (start, candidates) = if parts.is_empty() {
+            // Empty line - show all commands
+            (
+                0,
+                COMMANDS
+                    .iter()
+                    .map(|&cmd| Pair {
+                        display: cmd.to_string(),
+                        replacement: cmd.to_string(),
+                    })
+                    .collect(),
+            )
+        } else {
+            let last_word = parts.last().unwrap();
+            let last_word_start = line[..pos].rfind(last_word).unwrap_or(0);
+
+            // Check if we're completing a number prefix
+            if last_word.chars().all(|c| c.is_digit(10)) && pos == line.len() {
+                (
+                    pos,
+                    vec![Pair {
+                        display: " connect".to_string(),
+                        replacement: " connect".to_string(),
+                    }],
+                )
+            } else {
+                // Filter commands that match the current word
+                let matches: Vec<Pair> = COMMANDS
+                    .iter()
+                    .filter(|&cmd| cmd.starts_with(last_word))
+                    .map(|&cmd| Pair {
+                        display: cmd.to_string(),
+                        replacement: cmd.to_string(),
+                    })
+                    .collect();
+                (last_word_start, matches)
+            }
+        };
+
+        Ok((start, candidates))
+    }
+}
+
+impl Highlighter for ReplHelper {
+    fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
+        Borrowed(hint)
+    }
+}
+
+impl Hinter for ReplHelper {
+    type Hint = String;
+
+    fn hint(&self, line: &str, pos: usize, ctx: &Context<'_>) -> Option<String> {
+        self.hinter.hint(line, pos, ctx)
+    }
+}
+
+impl Validator for ReplHelper {
+    fn validate(
+        &self,
+        ctx: &mut rustyline::validate::ValidationContext,
+    ) -> rustyline::Result<rustyline::validate::ValidationResult> {
+        self.validator.validate(ctx)
+    }
+}
+
+impl Helper for ReplHelper {}
+
 pub struct ClientRepl {
     client: ProtonClient,
     server_addr: SocketAddr,
     connection: Option<ProtonConnection>,
+    editor: Editor<ReplHelper, FileHistory>,
 }
 
 impl ClientRepl {
     pub fn new(bind_addr: SocketAddr, server_addr: SocketAddr) -> Result<Self, Box<dyn Error>> {
         let client = ProtonClient::new(bind_addr)?;
+
+        // Configure readline
+        let config = Config::builder()
+            .history_ignore_space(true)
+            .completion_type(CompletionType::List)
+            .build();
+
+        let mut editor = Editor::with_config(config)?;
+        editor.set_helper(Some(ReplHelper::new()));
+
+        // Load history from ~/.proton_history
+        if let Some(mut home) = home::home_dir() {
+            home.push(".proton_history");
+            let _ = editor.load_history(&home);
+        }
+
         Ok(Self {
             client,
             server_addr,
             connection: None,
+            editor,
         })
     }
 
@@ -35,6 +172,10 @@ impl ClientRepl {
         println!("  exit             - Exit the REPL");
         println!("\nCommands can be chained with semicolons:");
         println!("  Example: connect 5; sleep 2; send_event; read_action");
+        println!("\nRepeat prefix:");
+        println!("  Commands can be prefixed with a number to repeat them");
+        println!("  Example: 5 connect    - Connects 5 times");
+        println!("  Example: 3 send_event - Sends 3 events");
         println!("\nConnection handling:");
         println!("  - Multiple connects allowed to test connection handling");
         println!("  - Use 'reset' to cleanup all connections and start fresh");
@@ -163,10 +304,36 @@ impl ClientRepl {
         }
     }
 
+    async fn parse_and_handle_command(&mut self, command: &str) -> bool {
+        let parts: Vec<&str> = command.trim().splitn(2, ' ').collect();
+
+        // Check if first part is a number (repeat count)
+        let (repeat_count, cmd) = if let Ok(count) = parts[0].parse::<u32>() {
+            if parts.len() < 2 {
+                println!("Error: Repeat count needs a command");
+                return true;
+            }
+            (count, parts[1])
+        } else {
+            (1, command)
+        };
+
+        // Execute the command repeat_count times
+        for i in 0..repeat_count {
+            if repeat_count > 1 {
+                println!("Execution {} of {}:", i + 1, repeat_count);
+            }
+            if !self.handle_single_command(cmd).await {
+                return false;
+            }
+        }
+        true
+    }
+
     async fn handle_command(&mut self, command: &str) -> bool {
         // Split commands by semicolon and handle each one
         for cmd in command.split(';') {
-            if !self.handle_single_command(cmd.trim()).await {
+            if !self.parse_and_handle_command(cmd.trim()).await {
                 return false; // Exit if any command returns false (i.e., exit command)
             }
         }
@@ -177,17 +344,45 @@ impl ClientRepl {
         println!("Starting REPL client mode...");
         Self::print_help();
 
-        let mut input = String::new();
         loop {
-            print!("> ");
-            io::stdout().flush()?;
-            input.clear();
-            io::stdin().read_line(&mut input)?;
+            let readline = self.editor.readline("> ");
+            match readline {
+                Ok(line) => {
+                    let line = line.trim();
+                    if !line.is_empty() {
+                        self.editor.add_history_entry(line)?;
+                    }
 
-            if !self.handle_command(input.trim()).await {
-                break;
+                    if !self.handle_command(line).await {
+                        break;
+                    }
+                }
+                Err(ReadlineError::Interrupted) => {
+                    println!("^C");
+                    continue;
+                }
+                Err(ReadlineError::Eof) => {
+                    println!("^D");
+                    break;
+                }
+                Err(err) => {
+                    println!("Error: {}", err);
+                    break;
+                }
             }
         }
+
+        // Save history
+        if let Some(mut home) = home::home_dir() {
+            home.push(".proton_history");
+            let _ = self.editor.save_history(&home);
+        }
+
+        // Cleanup connection if exists
+        if let Some(ref mut conn) = self.connection {
+            conn.close().await;
+        }
+
         Ok(())
     }
 }
