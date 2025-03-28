@@ -74,17 +74,26 @@ async fn handle_connection(conn: quinn::Connecting) -> Result<(), Box<dyn std::e
 
     while let Ok((mut send, mut recv)) = connection.accept_bi().await {
         println!("New bidirectional stream");
+        loop {
+            // Read a u32 value
+            let value = match recv.read_u32_le().await {
+                Ok(val) => {
+                    println!("Received u32: {}", val);
+                    val
+                }
+                Err(e) => {
+                    println!("Error reading u32: {}", e);
+                    break;
+                }
+            };
 
-        // Read the incoming message
-        let mut buf = vec![0; 1024];
-        let n = recv.read(&mut buf).await?.unwrap_or(0);
-        let message = String::from_utf8_lossy(&buf[..n]);
-        println!("Received: {}", message);
-
-        // Send response
-        let response = format!("Server received: {}", message);
-        send.write_all(response.as_bytes()).await?;
-        println!("Sent response");
+            // Echo the same u32 back
+            if let Err(e) = send.write_u32(value).await {
+                println!("Error sending response: {}", e);
+                break;
+            }
+            println!("Echoed back u32: {}", value);
+        }
     }
 
     Ok(())
@@ -137,16 +146,35 @@ async fn run_client(
     // Open bidirectional stream
     let (mut send, mut recv) = connection.open_bi().await?;
 
-    // Send message
-    send.write_all(message.as_bytes()).await?;
-    println!("Sent message: {}", message);
+    // Send message in a loop
+    let mut counter = 0;
+    loop {
+        println!("Loop {}", counter);
 
-    // Read response
-    let mut buf = vec![0; 1024];
-    let n = recv.read(&mut buf).await?.unwrap_or(0);
-    let response = String::from_utf8_lossy(&buf[..n]);
-    println!("Received response: {}", response);
+        // Prepare a u32 message (counter)
+        let value = counter as u32;
+        let bytes = value.to_le_bytes();
+        // Send the u32 value
+        send.write_all(&bytes).await?;
+        println!("Sent u32 value: {}", value);
 
+        counter += 1;
+        tokio::time::sleep(tokio::time::Duration::from_micros(100)).await;
+
+        // Read u32 response
+        let mut buf = [0u8; 4]; // Exactly 4 bytes for u32
+        match recv.read_exact(&mut buf).await {
+            Ok(()) => {
+                let response = u32::from_le_bytes(buf);
+                println!("Received u32 response: {}", response);
+            }
+            Err(e) => {
+                println!("Error reading response: {}", e);
+                break;
+            }
+        }
+    }
+    println!("Finished sending messages");
     Ok(())
 }
 
