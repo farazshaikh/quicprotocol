@@ -47,7 +47,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             println!("Connecting to Proton server at {}...", server_addr);
 
             let mut client = ProtonClient::new(bind_addr)?;
-            let mut connection = client.connect(server_addr).await?;
+            let mut connection = client.connect(server_addr, None).await?;
 
             // Example: Send events and read actions in a loop
             for i in 0..5 {

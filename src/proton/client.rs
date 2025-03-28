@@ -5,6 +5,7 @@ use crate::proton::{
 use quinn::{ClientConfig, Connection as QuinnConnection, Endpoint, RecvStream, SendStream};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::time::{sleep, timeout};
 
 struct StreamPair {
@@ -137,13 +138,12 @@ impl ProtonClient {
     pub async fn connect(
         &mut self,
         server_addr: SocketAddr,
+        startup_delay: Option<Duration>,
     ) -> Result<ProtonConnection, ProtonError> {
+        let delay = startup_delay.unwrap_or(STARTUP_DELAY);
         // Wait for startup delay to ensure old connections are cleaned up
-        println!(
-            "Waiting {} seconds for startup delay...",
-            STARTUP_DELAY.as_secs()
-        );
-        sleep(STARTUP_DELAY).await;
+        println!("Waiting {} seconds for startup delay...", delay.as_secs());
+        sleep(delay).await;
 
         // Try connecting to server with retries
         let mut retry_count = 0;

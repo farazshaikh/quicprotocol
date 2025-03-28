@@ -1,5 +1,5 @@
 use crate::proton::client::ProtonConnection;
-use crate::proton::ProtonClient;
+use crate::proton::{ProtonClient, IDLE_TIMEOUT};
 use std::error::Error;
 use std::io::{self, Write};
 use std::net::SocketAddr;
@@ -24,16 +24,20 @@ impl ClientRepl {
 
     fn print_help() {
         println!("Available commands:");
-        println!("  connect          - Connect to the server");
+        println!("  connect [secs]   - Connect to the server with optional startup delay");
         println!("  send_event       - Send an event");
         println!("  commit <id>      - Send a state commit with given ID");
         println!("  read_action      - Read an action from server");
         println!("  close            - Close the connection");
         println!("  sleep <secs>     - Sleep for specified seconds");
+        println!("  reset            - Reset client state and wait for connections to timeout");
         println!("  help             - Show this help message");
         println!("  exit             - Exit the REPL");
         println!("\nCommands can be chained with semicolons:");
-        println!("  Example: connect; sleep 2; send_event; read_action");
+        println!("  Example: connect 5; sleep 2; send_event; read_action");
+        println!("\nConnection handling:");
+        println!("  - Multiple connects allowed to test connection handling");
+        println!("  - Use 'reset' to cleanup all connections and start fresh");
     }
 
     async fn handle_single_command(&mut self, command: &str) -> bool {
@@ -42,19 +46,49 @@ impl ClientRepl {
                 Self::print_help();
                 true
             }
-            "connect" => {
+            cmd if cmd.starts_with("connect") => {
+                // Parse optional delay parameter
+                let delay = cmd
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .map(Duration::from_secs);
+
+                println!(
+                    "Connecting to server at {}{}...",
+                    self.server_addr,
+                    delay
+                        .map(|d| format!(" with {}s startup delay", d.as_secs()))
+                        .unwrap_or_default()
+                );
+
+                // If there's an existing connection, warn but proceed
                 if self.connection.is_some() {
-                    println!("Already connected! Close the current connection first.");
-                    return true;
+                    println!("Warning: Creating new connection while previous connection exists");
                 }
-                println!("Connecting to server at {}...", self.server_addr);
-                match self.client.connect(self.server_addr).await {
+
+                match self.client.connect(self.server_addr, delay).await {
                     Ok(conn) => {
                         println!("Connected successfully!");
+                        // Replace any existing connection
                         self.connection = Some(conn);
                     }
                     Err(e) => println!("Failed to connect: {}", e),
                 }
+                true
+            }
+            "reset" => {
+                // Close any existing connection
+                if let Some(ref mut conn) = self.connection {
+                    conn.close().await;
+                    self.connection = None;
+                }
+
+                // Wait for twice the idle timeout to ensure all connections are cleaned up
+                let wait_time = IDLE_TIMEOUT.as_secs() * 2;
+                println!("Waiting {}s for all connections to timeout...", wait_time);
+                sleep(Duration::from_secs(wait_time)).await;
+                println!("Reset complete. Client state cleared.");
                 true
             }
             "send_event" => {
